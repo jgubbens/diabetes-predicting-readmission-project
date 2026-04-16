@@ -10,4 +10,5 @@ Source: UCI Machine Learning Repository (https://archive.ics.uci.edu/dataset/296
 - Contains 101,766 hospital records of patients diagnosed with diabetes who underwent treatment and medication
 
 ## Methods
-- Bayesian Classifier
+- Bayesian Logistic Regression
+- Multilayer Perceptron
