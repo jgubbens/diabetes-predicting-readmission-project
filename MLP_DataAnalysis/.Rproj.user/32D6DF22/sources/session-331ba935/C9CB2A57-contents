@@ -1,0 +1,270 @@
+# Preprocessing Data
+
+library(dplyr)
+library(tidyr)
+
+# Load data
+df <- read.csv("data/diabetic_data.csv", stringsAsFactors = FALSE, na.strings = c("NA", ""))
+ids <- read.csv("data/IDS_mapping.csv", stringsAsFactors = FALSE)
+
+cat("Raw data dimensions:", nrow(df), "x", ncol(df), "\n")
+
+# Replace ? with NA
+df[df == "?"] <- NA
+
+# Drop useless columns
+# Weight is dropped due to a large number of missing values
+df <- df %>% select(-all_of(drop_cols))
+df <- df %>% "weight"
+df <- df %>% "payer_code"
+df <- df %>% "medical_specialty"
+df <- df %>% "examide"
+df <- df %>% "citoglipton"
+df <- df %>% "encounter_id"
+
+# Binarize target variable
+df$readmitted <- as.integer(df$readmitted == "<30")
+
+# Encode age
+age_map <- c(
+  "[0-10)" = 0, "[10-20)" = 1, "[20-30)" = 2, "[30-40)" = 3,  "[40-50)" = 4, "[50-60)" = 5,
+  "[60-70)" = 6, "[70-80)" = 7, "[80-90)" = 8, "[90-100)" = 9
+)
+# Iteratively apply map to df
+df$age <- age_map[df$age]
+
+# =============================================================================
+# 7. HANDLE max_glu_serum AND A1Cresult
+# These are ~95% and ~83% missing respectively.
+# Instead of imputing, create binary "was test taken" features.
+# =============================================================================
+
+df$A1C_taken  <- as.integer(!is.na(df$A1Cresult))
+df$glu_taken  <- as.integer(!is.na(df$max_glu_serum))
+
+df <- df %>% select(-A1Cresult, -max_glu_serum)
+
+# =============================================================================
+# 8. GROUP ICD-9 DIAGNOSIS CODES (diag_1, diag_2, diag_3)
+# =============================================================================
+
+group_icd9 <- function(code) {
+  if (is.na(code)) return("Other")
+  
+  # Handle V and E codes (alphanumeric)
+  if (grepl("^V", code)) return("Other")
+  if (grepl("^E", code)) return("Other")
+  
+  # Try to convert to numeric
+  num <- suppressWarnings(as.numeric(code))
+  if (is.na(num)) return("Other")
+  
+  if (num >= 390 & num <= 459 | num == 785)       return("Circulatory")
+  if (num >= 460 & num <= 519 | num == 786)        return("Respiratory")
+  if (num >= 520 & num <= 579 | num == 787)        return("Digestive")
+  if (num >= 250 & num < 251)                      return("Diabetes")
+  if (num >= 800 & num <= 999)                     return("Injury")
+  if (num >= 710 & num <= 739)                     return("Musculoskeletal")
+  if (num >= 580 & num <= 629 | num == 788)        return("Genitourinary")
+  if (num >= 140 & num <= 239)                     return("Neoplasms")
+  return("Other")
+}
+
+df$diag_1 <- sapply(df$diag_1, group_icd9)
+df$diag_2 <- sapply(df$diag_2, group_icd9)
+df$diag_3 <- sapply(df$diag_3, group_icd9)
+
+# Encode medicine columns
+medicine_cols <- c(
+  "metformin", "repaglinide", "nateglinide", "chlorpropamide",
+  "glimepiride", "acetohexamide", "glipizide", "glyburide",
+  "tolbutamide", "pioglitazone", "rosiglitazone", "acarbose",
+  "miglitol", "troglitazone", "tolazamide", "insulin",
+  "glyburide.metformin", "glipizide.metformin",
+  "glimepiride.pioglitazone", "metformin.rosiglitazone",
+  "metformin.pioglitazone"
+)
+
+for (col in medicine_cols) {
+  if (col %in% colnames(df)) {
+    df[[col]] <- as.integer(df[[col]] != "No")
+  }
+}
+
+# =============================================================================
+# 10. DECODE ID COLUMNS USING IDS_mapping.csv
+# admission_type_id, discharge_disposition_id, admission_source_id
+# =============================================================================
+
+# Parse the stacked IDS mapping file into three separate lookup tables
+parse_ids_mapping <- function(ids_df) {
+  # Find rows that are section headers (non-numeric in the ID column)
+  headers <- which(is.na(suppressWarnings(as.numeric(ids_df[[1]]))) & 
+                     !is.na(ids_df[[1]]))
+  
+  sections <- list()
+  for (i in seq_along(headers)) {
+    start_row <- headers[i] + 1
+    end_row   <- if (i < length(headers)) headers[i + 1] - 1 else nrow(ids_df)
+    section_name <- ids_df[[1]][headers[i]]
+    section_data <- ids_df[start_row:end_row, ]
+    section_data <- section_data[!is.na(suppressWarnings(as.numeric(section_data[[1]]))), ]
+    colnames(section_data) <- c("id", "description")
+    section_data$id <- as.integer(section_data$id)
+    sections[[section_name]] <- section_data
+  }
+  return(sections)
+}
+
+mappings <- parse_ids_mapping(ids)
+
+# Simplify discharge disposition into clinically meaningful groups
+simplify_discharge <- function(id) {
+  id <- as.integer(id)
+  if (is.na(id))           return("Unknown")
+  if (id == 1)             return("Home")
+  if (id %in% c(2,3,4,5)) return("Transfer")
+  if (id == 6)             return("Home_Health")
+  if (id == 7)             return("AMA")           # Left against medical advice
+  if (id %in% c(11,19,20,21)) return("Expired")
+  if (id %in% c(13,14))   return("Hospice")
+  return("Other")
+}
+
+# Simplify admission type
+simplify_admission <- function(id) {
+  id <- as.integer(id)
+  if (is.na(id))       return("Unknown")
+  if (id == 1)         return("Emergency")
+  if (id == 2)         return("Urgent")
+  if (id == 3)         return("Elective")
+  if (id == 4)         return("Newborn")
+  return("Other")
+}
+
+# Simplify admission source
+simplify_source <- function(id) {
+  id <- as.integer(id)
+  if (is.na(id))       return("Unknown")
+  if (id == 7)         return("EmergencyRoom")
+  if (id == 1)         return("PhysicianReferral")
+  if (id %in% c(2,3))  return("ClinicOrHMO")
+  if (id %in% c(4,5,6,10)) return("Transfer")
+  return("Other")
+}
+
+df$discharge_disposition_id <- sapply(df$discharge_disposition_id, simplify_discharge)
+df$admission_type_id        <- sapply(df$admission_type_id,        simplify_admission)
+df$admission_source_id      <- sapply(df$admission_source_id,      simplify_source)
+
+# =============================================================================
+# 11. ENCODE REMAINING BINARY CATEGORICALS
+# =============================================================================
+
+df$gender      <- as.integer(df$gender == "Male")   # 1 = Male, 0 = Female
+# drop the 3 Unknown/Invalid rows
+df <- df %>% filter(!is.na(gender) & df$gender %in% c(0, 1) | TRUE)
+df$gender[df$gender == "Unknown/Invalid"] <- NA
+df$gender <- as.integer(df$gender == 1)
+
+df$change      <- as.integer(df$change == "Ch")      # 1 = medication changed
+df$diabetesMed <- as.integer(df$diabetesMed == "Yes")
+
+# =============================================================================
+# 12. ONE-HOT ENCODE NOMINAL CATEGORICALS
+# =============================================================================
+
+one_hot <- function(df, col) {
+  vals <- sort(unique(df[[col]]))
+  # Drop first level to avoid multicollinearity (reference category)
+  vals <- vals[-1]
+  for (v in vals) {
+    new_col <- paste0(col, "_", gsub("[^A-Za-z0-9]", "_", v))
+    df[[new_col]] <- as.integer(df[[col]] == v)
+  }
+  df[[col]] <- NULL
+  return(df)
+}
+
+cat_cols_to_encode <- c(
+  "race", "diag_1", "diag_2", "diag_3",
+  "admission_type_id", "discharge_disposition_id", "admission_source_id"
+)
+
+for (col in cat_cols_to_encode) {
+  df <- one_hot(df, col)
+}
+
+# =============================================================================
+# 13. DROP REMAINING ROWS WITH NA
+# =============================================================================
+
+n_before <- nrow(df)
+df <- df %>% drop_na()
+cat("Dropped", n_before - nrow(df), "rows with remaining NAs\n")
+cat("Final dimensions:", nrow(df), "x", ncol(df), "\n")
+cat("Final readmission rate:", round(mean(df$readmitted) * 100, 2), "%\n")
+
+# =============================================================================
+# 14. SCALE NUMERIC FEATURES
+# =============================================================================
+
+numeric_cols <- c(
+  "time_in_hospital", "num_lab_procedures", "num_procedures",
+  "num_medications", "number_outpatient", "number_emergency",
+  "number_inpatient", "number_diagnoses", "age"
+)
+
+# Save means and SDs from training set (applied after splitting)
+# We scale AFTER splitting to avoid data leakage
+
+# =============================================================================
+# 15. TRAIN / TEST SPLIT (80/20, stratified)
+# =============================================================================
+
+set.seed(42)
+
+pos_idx <- which(df$readmitted == 1)
+neg_idx <- which(df$readmitted == 0)
+
+train_pos <- sample(pos_idx, size = floor(0.8 * length(pos_idx)))
+train_neg <- sample(neg_idx, size = floor(0.8 * length(neg_idx)))
+
+train_idx <- c(train_pos, train_neg)
+test_idx  <- setdiff(seq_len(nrow(df)), train_idx)
+
+train_df <- df[train_idx, ]
+test_df  <- df[test_idx,  ]
+
+# Scale numeric columns using TRAINING set stats only (no leakage)
+scale_means <- sapply(train_df[, numeric_cols], mean)
+scale_sds   <- sapply(train_df[, numeric_cols], sd)
+
+for (col in numeric_cols) {
+  train_df[[col]] <- (train_df[[col]] - scale_means[col]) / scale_sds[col]
+  test_df[[col]]  <- (test_df[[col]]  - scale_means[col]) / scale_sds[col]
+}
+
+cat("\nTrain set:", nrow(train_df), "rows |",
+    "Readmission rate:", round(mean(train_df$readmitted) * 100, 2), "%\n")
+cat("Test set: ", nrow(test_df),  "rows |",
+    "Readmission rate:", round(mean(test_df$readmitted)  * 100, 2), "%\n")
+
+# =============================================================================
+# 16. SAVE PROCESSED DATA
+# =============================================================================
+
+write.csv(train_df, "train_processed.csv", row.names = FALSE)
+write.csv(test_df,  "test_processed.csv",  row.names = FALSE)
+
+cat("\nSaved: train_processed.csv and test_processed.csv\n")
+
+# Also save feature matrix and target as separate objects for the MLP
+X_train <- as.matrix(train_df %>% select(-readmitted))
+y_train <- train_df$readmitted
+
+X_test  <- as.matrix(test_df %>% select(-readmitted))
+y_test  <- test_df$readmitted
+
+cat("X_train dimensions:", dim(X_train), "\n")
+cat("X_test dimensions: ", dim(X_test),  "\n")

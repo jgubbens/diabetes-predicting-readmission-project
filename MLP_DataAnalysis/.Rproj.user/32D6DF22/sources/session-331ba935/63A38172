@@ -1,0 +1,26 @@
+{
+    "id": "63A38172",
+    "path": "~/Downloads/nn_mlp.R",
+    "project_path": null,
+    "type": "r_source",
+    "hash": "0",
+    "contents": "",
+    "dirty": false,
+    "created": 1776311227512.0,
+    "source_on_save": false,
+    "relative_order": 2,
+    "properties": {
+        "source_window_id": "",
+        "Source": "Source",
+        "cursorPosition": "38,13",
+        "scrollLine": "26"
+    },
+    "folds": "",
+    "lastKnownWriteTime": 1776311179,
+    "encoding": "UTF-8",
+    "collab_server": "",
+    "source_window": "",
+    "last_content_update": 1776311179,
+    "read_only": false,
+    "read_only_alternatives": []
+}

@@ -1,0 +1,202 @@
+# ggplot2 is a powerful R plotting package
+library(ggplot2)
+
+# image matrix
+X <- matrix(c(1, 1, 1, 0, 0, 0,
+              1, 0, 1, 0, 0, 0,
+              1, 1, 1, 1, 0, 0,
+              0, 0, 1, 1, 0, 0,
+              0, 0, 0, 0, 1, 0,
+              0, 0, 0, 0, 0, 1), nrow = 6, byrow = TRUE)
+
+# write a function that will display the image
+plot_img <- function(x, im_shape = c(6, 6)) {
+  # need to convert matrix to data frame for ggplot
+  df <- data.frame(expand.grid(x = 1:im_shape[2], y = 1:im_shape[1]),
+                   value = as.vector(t(x)))
+  
+  ggplot(df, aes(x, y, fill = value)) +
+    geom_tile() +
+    # can choose how to map the 0 and 1 (I'm copying cmap from python here)
+    scale_fill_gradient(low = "black", high = "white") +
+    theme_void() +
+    theme(aspect.ratio = 1) +
+    scale_y_reverse()
+}
+
+plot_img(X)
+
+# sharpening kernel
+W <- matrix(c(0, -1, 0,
+              -1, 5, -1,
+              0, -1, 0), nrow = 3, byrow = TRUE)
+
+# convolution function (Simplified for square images/kernels only)
+convMat <- function(X, W) {
+  # get the dimensions of the kernel and input
+  k <- nrow(W)
+  p <- nrow(X)
+  
+  # calculate the dimensions of the output matrix
+  q <- p - k + 1
+  G <- matrix(0, nrow = q, ncol = q)
+  
+  # do the thing
+  for (m in 1:q) {
+    for (n in 1:q) {
+      submatrix <- X[m:(m+k-1), n:(n+k-1)]
+      G[m, n] <- sum(W * submatrix)
+    }
+  }
+  
+  return(G)
+}
+
+G <- convMat(X, W)
+G
+
+plot_img(G, im_shape = c(4, 4))
+
+# note (for future reference) that the plot_img function takes a vector
+# images will be stored in a matrix where each row is a flattened image:
+as.vector(X)
+
+plot_img(as.vector(X))
+
+
+
+# See the prebuilt CNN function with the MNIST data
+# R has the keras and tensorflow packages as well, but I couldn't get them to work (I think it's the same issue as my python)
+# instead, I'm using the torch package (which has a similar implementation)
+## install.packages("torch")
+## install.packages("torchvision)
+## torch::install_torch
+library(torch)
+library(torchvision)
+
+# grab the data
+# (may not have to run download = TRUE upon subsequent runs)
+mnist_train <- torchvision::mnist_dataset(root = tempfile(), train = TRUE, download = TRUE)
+mnist_test <- torchvision::mnist_dataset(root = tempfile(), train = FALSE, download = TRUE)
+x_train <- mnist_train$data
+y_train <- mnist_train$targets
+x_test <- mnist_test$data
+y_test <- mnist_test$targets
+
+# normalize the data and make sure the output feature is the right object type
+x_train <- x_train / 255
+x_test <- x_test / 255
+y_train <- as.integer(y_train)
+y_test <- as.integer(y_test)
+
+# reshape the data for the torch implementation
+x_train <- torch_tensor(array(x_train, dim = c(dim(x_train)[1], 1, 28, 28)), dtype = torch_float())
+x_test <- torch_tensor(array(x_test, dim = c(dim(x_test)[1], 1, 28, 28)), dtype = torch_float())
+
+# simplify the problem to just predicting 6 vs not 6
+y_6train <- torch_tensor(as.numeric(y_train == 6), dtype = torch_float())
+y_6test <- torch_tensor(as.numeric(y_test == 6), dtype = torch_float())
+
+# check out the last image of the test set
+plot_img(as.matrix(x_test[nrow(x_test),1,,]), im_shape = c(28, 28))
+
+# to build a CNN with one Convolutional Layer
+# (with a single 3 by 3 kernel with stride 1 and no activation (you could add an activation to the Convolutional Layer if you wanted))
+# and a single hidden layer with ReLU activation
+# and using the sigmoid activation for the output:
+
+# Note: the torch syntax is similar, but a bit different (and maybe not quite as intuitive? you decide)
+# this defines the full CNN
+cnn_model <- nn_module(
+  initialize = function() {
+    # the channels are both 1 because we have black and white images (single matrix for each image)
+    # this is the convolutional layer
+    # this implementation is much slower than keras, so I'm going to use a bigger kernel (7 by 7)
+    self$conv <- nn_conv2d(in_channels = 1, out_channels = 1, kernel_size = 3, stride = 1)
+    # this is the hidden layer (I'm also speeding up things by making the network less wide)
+    self$hid <- nn_linear(in_features = 26 * 26, out_features = 250) # after convolution, image dims reduce to 26x26
+    #self$hid2 <- nn_linear(in_features = 250, out_features = 100)
+    # this is the output layer
+    self$out <- nn_linear(in_features = 250, out_features = 1)
+  },
+  # we're just going to call the data x which will be passed through each layer:
+  forward = function(x) {
+    x <- self$conv(x)
+    x <- torch_flatten(x, start_dim = 2) # Flatten except for channel dimension
+    x <- self$hid(x)
+    x <- torch_relu(x)
+    #x <- self$hid2(x)
+    #x <- torch_tanh(x)
+    x <- self$out(x)
+    torch_sigmoid(x)
+  }
+)
+
+# initialize the model
+model <- cnn_model()
+
+# define the loss function and optimizer
+loss_fn <- nn_bce_loss() # Binary Cross-Entropy (log-loss equivalent)
+optimizer <- optim_sgd(model$parameters, lr = 0.2) #SGD (stochastic gradient descent)
+
+epochs <- 10
+n <- dim(x_train)[1]
+
+# loop through the epochs manually
+# (I think keras is a lot better here... I had to manually write out the updates that keras would)
+# another way to speed it up is to implement a batch size, though the larger the batch size, the worse the fit tends to be
+batch_size <- 32
+
+for (epoch in seq_len(epochs)) {
+  model$train()
+  epoch_loss <- 0
+  
+  #  for (i in seq_len(n)) { #if not using batch size (will take MUCH longer)
+  for (i in seq(1, n, by = batch_size)) {
+    start <- i # only if using batch_size, comment out to do full training set
+    end <- min(i + batch_size - 1, n) # only if using batch_size, comment out to do full training set
+    
+    # inputs <-x_train[i,,,drop = FALSE] #if not using batch size (will take MUCH longer)
+    # output <- y_6train[i, drop = FALSE] #if not using batch size (will take MUCH longer)
+    inputs <- x_train[start:end,,,]
+    output <- y_6train[start:end]
+    
+    # forward pass
+    preds <- model(inputs)
+    loss <- loss_fn(preds, output)
+    
+    # backprop
+    optimizer$zero_grad()
+    loss$backward()
+    optimizer$step()
+    
+    epoch_loss <- epoch_loss + loss$item()
+  }
+  
+  # cat(sprintf("Epoch %d, Loss: %.4f\n", epoch, epoch_loss / n)) #if not using batch size (will take MUCH longer)
+  cat(sprintf("Epoch %d, Loss: %.4f\n", epoch, epoch_loss / (n / batch_size)))
+}
+
+# Checking test set performance
+# Could be worse than the keras implementation because of all my "speed up" tricks above
+model$eval()
+with_no_grad({
+  preds <- model(x_test)
+  loss <- loss_fn(preds, y_6test)
+  accuracy <- mean(as.integer(preds) == as.integer(y_6test))
+})
+
+cat('Test Loss:', loss$item(), '\n')
+cat('Test Accuracy:', accuracy, '\n')
+
+# Seems good, but check HOW it's good
+table(Predicted = as.integer(preds), Acutal = as.integer(y_6test))
+
+# print kernel weights of the convolutional layer
+conv_weights <- model$conv$weight$detach()
+W <- as.matrix(conv_weights[1, 1, , ])
+W
+
+G <- convMat(as.matrix(x_test[nrow(x_test),1,,]), W)
+
+plot_img(G, c(26,26))

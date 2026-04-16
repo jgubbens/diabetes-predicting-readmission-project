@@ -1,0 +1,480 @@
+---
+title: "Diabetes Analysis MLP"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, cache = FALSE)
+```
+
+## Data Preprocessing
+
+```{r preprocess_data}
+# Preprocessing Data
+
+library(dplyr)
+library(tidyr)
+
+# Load data
+df <- read.csv("data/diabetic_data.csv", stringsAsFactors = FALSE, na.strings = c("NA", ""))
+ids <- read.csv("data/IDS_mapping.csv", stringsAsFactors = FALSE)
+
+cat("Raw data dimensions:", nrow(df), "x", ncol(df), "\n")
+
+# Replace ? with NA
+df[df == "?"] <- NA
+
+# Drop useless columns
+# Weight is dropped due to a large number of missing values
+df <- df %>% select(-weight)
+df <- df %>% select(-payer_code)
+df <- df %>% select(-medical_specialty)
+df <- df %>% select(-examide)
+df <- df %>% select(-citoglipton)
+df <- df %>% select(-encounter_id)
+df <- df %>% select(-patient_nbr)
+
+# Binarize target variable
+df$readmitted <- as.integer(df$readmitted == "<30")
+
+# Encode age
+age_map <- c(
+  "[0-10)" = 0, "[10-20)" = 1, "[20-30)" = 2, "[30-40)" = 3,  "[40-50)" = 4, "[50-60)" = 5,
+  "[60-70)" = 6, "[70-80)" = 7, "[80-90)" = 8, "[90-100)" = 9
+)
+# Iteratively apply map to df
+df$age <- age_map[df$age]
+
+# =============================================================================
+# 7. HANDLE max_glu_serum AND A1Cresult
+# These are ~95% and ~83% missing respectively.
+# Instead of imputing, create binary "was test taken" features.
+# =============================================================================
+
+df$A1C_taken  <- as.integer(!is.na(df$A1Cresult))
+df$glu_taken  <- as.integer(!is.na(df$max_glu_serum))
+
+df <- df %>% select(-A1Cresult, -max_glu_serum)
+
+# =============================================================================
+# 8. GROUP ICD-9 DIAGNOSIS CODES (diag_1, diag_2, diag_3)
+# =============================================================================
+
+group_icd9 <- function(code) {
+  if (is.na(code)) return("Other")
+  
+  # Handle V and E codes (alphanumeric)
+  if (grepl("^V", code)) return("Other")
+  if (grepl("^E", code)) return("Other")
+  
+  # Try to convert to numeric
+  num <- suppressWarnings(as.numeric(code))
+  if (is.na(num)) return("Other")
+  
+  if (num >= 390 & num <= 459 | num == 785)       return("Circulatory")
+  if (num >= 460 & num <= 519 | num == 786)        return("Respiratory")
+  if (num >= 520 & num <= 579 | num == 787)        return("Digestive")
+  if (num >= 250 & num < 251)                      return("Diabetes")
+  if (num >= 800 & num <= 999)                     return("Injury")
+  if (num >= 710 & num <= 739)                     return("Musculoskeletal")
+  if (num >= 580 & num <= 629 | num == 788)        return("Genitourinary")
+  if (num >= 140 & num <= 239)                     return("Neoplasms")
+  return("Other")
+}
+
+df$diag_1 <- sapply(df$diag_1, group_icd9)
+df$diag_2 <- sapply(df$diag_2, group_icd9)
+df$diag_3 <- sapply(df$diag_3, group_icd9)
+
+# Encode medicine columns
+medicine_cols <- c(
+  "metformin", "repaglinide", "nateglinide", "chlorpropamide",
+  "glimepiride", "acetohexamide", "glipizide", "glyburide",
+  "tolbutamide", "pioglitazone", "rosiglitazone", "acarbose",
+  "miglitol", "troglitazone", "tolazamide", "insulin",
+  "glyburide.metformin", "glipizide.metformin",
+  "glimepiride.pioglitazone", "metformin.rosiglitazone",
+  "metformin.pioglitazone"
+)
+
+for (col in medicine_cols) {
+  if (col %in% colnames(df)) {
+    df[[col]] <- as.integer(df[[col]] != "No")
+  }
+}
+
+# =============================================================================
+# 10. DECODE ID COLUMNS USING IDS_mapping.csv
+# admission_type_id, discharge_disposition_id, admission_source_id
+# =============================================================================
+
+# Parse the stacked IDS mapping file into three separate lookup tables
+parse_ids_mapping <- function(ids_df) {
+  # Find rows that are section headers (non-numeric in the ID column)
+  headers <- which(is.na(suppressWarnings(as.numeric(ids_df[[1]]))) & 
+                     !is.na(ids_df[[1]]))
+  
+  sections <- list()
+  for (i in seq_along(headers)) {
+    start_row <- headers[i] + 1
+    end_row   <- if (i < length(headers)) headers[i + 1] - 1 else nrow(ids_df)
+    section_name <- ids_df[[1]][headers[i]]
+    section_data <- ids_df[start_row:end_row, ]
+    section_data <- section_data[!is.na(suppressWarnings(as.numeric(section_data[[1]]))), ]
+    colnames(section_data) <- c("id", "description")
+    section_data$id <- as.integer(section_data$id)
+    sections[[section_name]] <- section_data
+  }
+  return(sections)
+}
+
+mappings <- parse_ids_mapping(ids)
+
+# Simplify discharge disposition into clinically meaningful groups
+simplify_discharge <- function(id) {
+  id <- as.integer(id)
+  if (is.na(id))           return("Unknown")
+  if (id == 1)             return("Home")
+  if (id %in% c(2,3,4,5)) return("Transfer")
+  if (id == 6)             return("Home_Health")
+  if (id == 7)             return("AMA")           # Left against medical advice
+  if (id %in% c(11,19,20,21)) return("Expired")
+  if (id %in% c(13,14))   return("Hospice")
+  return("Other")
+}
+
+# Simplify admission type
+simplify_admission <- function(id) {
+  id <- as.integer(id)
+  if (is.na(id))       return("Unknown")
+  if (id == 1)         return("Emergency")
+  if (id == 2)         return("Urgent")
+  if (id == 3)         return("Elective")
+  if (id == 4)         return("Newborn")
+  return("Other")
+}
+
+# Simplify admission source
+simplify_source <- function(id) {
+  id <- as.integer(id)
+  if (is.na(id))       return("Unknown")
+  if (id == 7)         return("EmergencyRoom")
+  if (id == 1)         return("PhysicianReferral")
+  if (id %in% c(2,3))  return("ClinicOrHMO")
+  if (id %in% c(4,5,6,10)) return("Transfer")
+  return("Other")
+}
+
+df$discharge_disposition_id <- sapply(df$discharge_disposition_id, simplify_discharge)
+df$admission_type_id        <- sapply(df$admission_type_id,        simplify_admission)
+df$admission_source_id      <- sapply(df$admission_source_id,      simplify_source)
+
+# =============================================================================
+# 11. ENCODE REMAINING BINARY CATEGORICALS
+# =============================================================================
+
+df <- df %>% filter(gender != "Unknown/Invalid" | is.na(gender))
+df$gender <- as.integer(df$gender == "Male")
+
+df$change      <- as.integer(df$change == "Ch")      # 1 = medication changed
+df$diabetesMed <- as.integer(df$diabetesMed == "Yes")
+
+# =============================================================================
+# 12. ONE-HOT ENCODE NOMINAL CATEGORICALS
+# =============================================================================
+
+one_hot <- function(df, col) {
+  vals <- sort(unique(df[[col]]))
+  # Drop first level to avoid multicollinearity (reference category)
+  vals <- vals[-1]
+  for (v in vals) {
+    new_col <- paste0(col, "_", gsub("[^A-Za-z0-9]", "_", v))
+    df[[new_col]] <- as.integer(df[[col]] == v)
+  }
+  df[[col]] <- NULL
+  return(df)
+}
+
+cat_cols_to_encode <- c(
+  "race", "diag_1", "diag_2", "diag_3",
+  "admission_type_id", "discharge_disposition_id", "admission_source_id"
+)
+
+for (col in cat_cols_to_encode) {
+  df <- one_hot(df, col)
+}
+
+# =============================================================================
+# 13. DROP REMAINING ROWS WITH NA
+# =============================================================================
+
+n_before <- nrow(df)
+df <- df %>% drop_na()
+cat("Dropped", n_before - nrow(df), "rows with remaining NAs\n")
+cat("Final dimensions:", nrow(df), "x", ncol(df), "\n")
+cat("Final readmission rate:", round(mean(df$readmitted) * 100, 2), "%\n")
+
+# =============================================================================
+# 14. SCALE NUMERIC FEATURES
+# =============================================================================
+
+numeric_cols <- c(
+  "time_in_hospital", "num_lab_procedures", "num_procedures",
+  "num_medications", "number_outpatient", "number_emergency",
+  "number_inpatient", "number_diagnoses", "age"
+)
+
+# Save means and SDs from training set (applied after splitting)
+# We scale AFTER splitting to avoid data leakage
+
+# =============================================================================
+# 15. TRAIN / TEST SPLIT (80/20, stratified)
+# =============================================================================
+
+set.seed(42)
+
+pos_idx <- which(df$readmitted == 1)
+neg_idx <- which(df$readmitted == 0)
+
+train_pos <- sample(pos_idx, size = floor(0.8 * length(pos_idx)))
+train_neg <- sample(neg_idx, size = floor(0.8 * length(neg_idx)))
+
+train_idx <- c(train_pos, train_neg)
+test_idx  <- setdiff(seq_len(nrow(df)), train_idx)
+
+train_df <- df[train_idx, ]
+test_df  <- df[test_idx,  ]
+
+# Scale numeric columns using TRAINING set stats only (no leakage)
+scale_means <- sapply(train_df[, numeric_cols], mean)
+scale_sds   <- sapply(train_df[, numeric_cols], sd)
+
+for (col in numeric_cols) {
+  train_df[[col]] <- (train_df[[col]] - scale_means[col]) / scale_sds[col]
+  test_df[[col]]  <- (test_df[[col]]  - scale_means[col]) / scale_sds[col]
+}
+
+cat("\nTrain set:", nrow(train_df), "rows |",
+    "Readmission rate:", round(mean(train_df$readmitted) * 100, 2), "%\n")
+cat("Test set: ", nrow(test_df),  "rows |",
+    "Readmission rate:", round(mean(test_df$readmitted)  * 100, 2), "%\n")
+
+
+# Also save feature matrix and target as separate objects for the MLP
+X_train <- as.matrix(train_df %>% select(-readmitted))
+y_train <- train_df$readmitted
+
+X_test <- as.matrix(test_df %>% select(-readmitted))
+y_test <- test_df$readmitted
+
+cat("X_train dimensions:", dim(X_train), "\n")
+cat("X_test dimensions: ", dim(X_test),  "\n")
+```
+
+## MLP
+
+```{r mlp}
+## MLP
+
+lrelu       <- function(x) ifelse(x > 0, x, 0.01 * x)
+lrelu_deriv <- function(x) ifelse(x > 0, 1.0, 0.01)
+sigmoid     <- function(x) 1.0 / (1.0 + exp(-pmax(-500, pmin(500, x))))
+
+bce_loss <- function(y_hat, y) {
+  -mean(y * log(y_hat + 1e-8) + (1 - y) * log(1 - y_hat + 1e-8))
+}
+
+adam_update <- function(param, grad, m, v, t, lr = 0.001,
+                        beta1 = 0.9, beta2 = 0.999, eps = 1e-8) {
+  m     <- beta1 * m + (1 - beta1) * grad
+  v     <- beta2 * v + (1 - beta2) * grad^2
+  m_hat <- m / (1 - beta1^t)
+  v_hat <- v / (1 - beta2^t)
+  param <- param - lr * m_hat / (sqrt(v_hat) + eps)
+  list(param = param, m = m, v = v)
+}
+
+# =============================================================================
+# Balance training set
+# =============================================================================
+
+set.seed(42)
+pos_idx_train   <- which(y_train == 1)
+neg_idx_train   <- which(y_train == 0)
+neg_idx_sampled <- sample(neg_idx_train, size = length(pos_idx_train))
+balanced_idx    <- sample(c(pos_idx_train, neg_idx_sampled))
+X_train_bal     <- X_train[balanced_idx, ]
+y_train_bal     <- y_train[balanced_idx]
+
+cat("Balanced train set:", nrow(X_train_bal), "rows | Positive rate:",
+    round(mean(y_train_bal) * 100, 2), "%\n")
+
+# =============================================================================
+# Initialise weights and Adam moments
+# =============================================================================
+
+n_input  <- ncol(X_train_bal)
+n_h1     <- 64
+n_h2     <- 32
+n_output <- 1
+
+set.seed(42)
+W1 <- matrix(rnorm(n_h1 * n_input),  nrow = n_h1)
+W2 <- matrix(rnorm(n_h2 * n_h1),     nrow = n_h2)
+W3 <- matrix(rnorm(n_output * n_h2), nrow = n_output)
+b1 <- matrix(0, nrow = n_h1,     ncol = 1)
+b2 <- matrix(0, nrow = n_h2,     ncol = 1)
+b3 <- matrix(0, nrow = n_output, ncol = 1)
+
+make_moments <- function(param) list(m = param * 0, v = param * 0)
+adam <- list(
+  W1 = make_moments(W1), W2 = make_moments(W2), W3 = make_moments(W3),
+  b1 = make_moments(b1), b2 = make_moments(b2), b3 = make_moments(b3)
+)
+
+# =============================================================================
+# Training loop
+# =============================================================================
+
+lr         <- 0.01
+epochs     <- 400
+batch_size <- 256
+n          <- nrow(X_train_bal)
+errors     <- numeric()
+adam_t     <- 0
+
+for (epoch in 1:epochs) {
+
+  shuffle_idx <- sample(1:n)
+  X_shuf      <- X_train_bal[shuffle_idx, ]
+  y_shuf      <- y_train_bal[shuffle_idx]
+
+  for (i in seq(1, n, by = batch_size)) {
+    end <- min(i + batch_size - 1, n)
+    if (end - i < 1) next
+    X_batch <- t(X_shuf[i:end, ])
+    y_batch <- y_shuf[i:end]
+    m       <- ncol(X_batch)
+    adam_t  <- adam_t + 1
+
+    # Forward
+    z1_pre <- W1 %*% X_batch + matrix(b1, nrow = n_h1, ncol = m)
+    a1     <- lrelu(z1_pre)
+
+    z2_pre <- W2 %*% a1 + matrix(b2, nrow = n_h2, ncol = m)
+    a2     <- lrelu(z2_pre)
+
+    z3    <- W3 %*% a2 + matrix(b3, nrow = n_output, ncol = m)
+    y_hat <- sigmoid(z3)
+
+    # Backward
+    dz3  <- y_hat - matrix(y_batch, nrow = 1)
+    dW3  <- (1/m) * dz3 %*% t(a2)
+    db3  <- matrix((1/m) * rowSums(dz3))
+
+    da2     <- t(W3) %*% dz3
+    dz2_pre <- da2 * lrelu_deriv(z2_pre)
+    dW2     <- (1/m) * dz2_pre %*% t(a1)
+    db2_grad <- matrix((1/m) * rowSums(dz2_pre))
+
+    da1     <- t(W2) %*% dz2_pre
+    dz1_pre <- da1 * lrelu_deriv(z1_pre)
+    dW1     <- (1/m) * dz1_pre %*% t(X_batch)
+    db1_grad <- matrix((1/m) * rowSums(dz1_pre))
+
+    # Adam updates
+    upd <- function(key, param, grad) {
+      r <- adam_update(param, grad, adam[[key]]$m, adam[[key]]$v, adam_t, lr)
+      adam[[key]]$m <<- r$m; adam[[key]]$v <<- r$v
+      r$param
+    }
+    W1 <- upd("W1", W1, dW1)
+    b1 <- upd("b1", b1, db1_grad)
+    W2 <- upd("W2", W2, dW2)
+    b2 <- upd("b2", b2, db2_grad)
+    W3 <- upd("W3", W3, dW3)
+    b3 <- upd("b3", b3, db3)
+  }
+
+  # Epoch-end loss
+  chunk <- 2000
+  preds <- numeric(n)
+  for (k in seq(1, n, by = chunk)) {
+    ke  <- min(k + chunk - 1, n)
+    xk  <- t(X_train_bal[k:ke, ])
+    mk  <- ncol(xk)
+    z1k <- W1 %*% xk + matrix(b1, nrow = n_h1, ncol = mk)
+    a1k <- lrelu(z1k)
+    z2k <- W2 %*% a1k + matrix(b2, nrow = n_h2, ncol = mk)
+    a2k <- lrelu(z2k)
+    z3k <- W3 %*% a2k + matrix(b3, nrow = n_output, ncol = mk)
+    preds[k:ke] <- as.vector(sigmoid(z3k))
+  }
+  e <- bce_loss(preds, y_train_bal)
+  errors <- c(errors, e)
+
+  if (epoch %% 10 == 0) cat(sprintf("Epoch %d | Loss: %.4f\n", epoch, e))
+}
+
+plot(1:epochs, errors, type = "l",
+     main = "Training Loss over Epochs",
+     xlab = "Epoch", ylab = "BCE Loss",
+     col = "steelblue", lwd = 2)
+
+# =============================================================================
+# Evaluation
+# =============================================================================
+
+chunk  <- 2000
+y_prob <- numeric(nrow(X_test))
+for (k in seq(1, nrow(X_test), by = chunk)) {
+  ke  <- min(k + chunk - 1, nrow(X_test))
+  xk  <- t(X_test[k:ke, ])
+  mk  <- ncol(xk)
+  z1k <- W1 %*% xk + matrix(b1, nrow = n_h1, ncol = mk)
+  a1k <- lrelu(z1k)
+  z2k <- W2 %*% a1k + matrix(b2, nrow = n_h2, ncol = mk)
+  a2k <- lrelu(z2k)
+  z3k <- W3 %*% a2k + matrix(b3, nrow = n_output, ncol = mk)
+  y_prob[k:ke] <- as.vector(sigmoid(z3k))
+}
+
+y_pred <- as.integer(y_prob >= 0.5)
+
+conf_matrix <- matrix(0, nrow = 2, ncol = 2,
+                      dimnames = list(Predicted = c("0","1"),
+                                      Actual    = c("0","1")))
+for (p in c("0","1")) for (a in c("0","1")) {
+  conf_matrix[p, a] <- sum(y_pred == as.integer(p) & y_test == as.integer(a))
+}
+print(conf_matrix)
+
+accuracy  <- mean(y_pred == y_test)
+tp        <- conf_matrix["1","1"]
+fp        <- conf_matrix["1","0"]
+fn        <- conf_matrix["0","1"]
+precision <- if ((tp+fp)>0) tp/(tp+fp) else 0
+recall    <- if ((tp+fn)>0) tp/(tp+fn) else 0
+f1        <- if ((precision+recall)>0) 2*precision*recall/(precision+recall) else 0
+
+cat(sprintf("Accuracy:  %.4f\n", accuracy))
+cat(sprintf("Precision: %.4f\n", precision))
+cat(sprintf("Recall:    %.4f\n", recall))
+cat(sprintf("F1 Score:  %.4f\n", f1))
+
+ord      <- order(y_prob, decreasing = TRUE)
+y_sorted <- y_test[ord]
+n_pos    <- sum(y_test == 1)
+n_neg    <- sum(y_test == 0)
+tpr      <- cumsum(y_sorted == 1) / n_pos
+fpr      <- cumsum(y_sorted == 0) / n_neg
+auc      <- sum(abs(diff(fpr)) * (tpr[-1] + tpr[-length(tpr)]) / 2)
+cat(sprintf("AUC-ROC:   %.4f\n", auc))
+
+plot(fpr, tpr, type = "l", col = "steelblue", lwd = 2,
+     main = "ROC Curve - MLP",
+     xlab = "False Positive Rate", ylab = "True Positive Rate")
+abline(a = 0, b = 1, lty = 2, col = "gray")
+legend("bottomright", legend = sprintf("AUC = %.4f", auc),
+       col = "steelblue", lwd = 2)
+```
